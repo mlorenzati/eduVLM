@@ -1,0 +1,8 @@
+torch
+torchvision
+transformers 
+accelerate
+opencv-python
+pillow
+qwen-vl-utils[decord]
+typeguard

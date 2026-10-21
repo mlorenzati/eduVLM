@@ -6,3 +6,6 @@ opencv-python
 pillow
 qwen-vl-utils[decord]
 typeguard
+fastapi
+uvicorn[standard]
+openai

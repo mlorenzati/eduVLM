@@ -128,6 +128,9 @@ Go to src and run the python examples by number
 Serves the VLM over HTTP using the **OpenAI API standard**, so it can be consumed
 externally by any OpenAI-compatible client (openai SDK, curl, LangChain, etc).
 
+**Full API contract for external consumers: [docs/API.md](docs/API.md)**
+(machine-readable OpenAPI spec at `http://<host>:8000/openapi.json`).
+
 Start the server (on the GPU machine):
 ```
 ./04_rest_api.py --host 0.0.0.0 --port 8000

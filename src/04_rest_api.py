@@ -21,6 +21,7 @@ Run:
 
 import argparse
 import base64
+import json
 import mimetypes
 import os
 import tempfile
@@ -306,7 +307,7 @@ def chat_completions(request: ChatCompletionRequest):
                     {"index": 0, "delta": {"content": token}, "finish_reason": None}
                 ],
             }
-            yield f"data: {chunk}\n\n"
+            yield f"data: {json.dumps(chunk)}\n\n"
         final = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -314,7 +315,7 @@ def chat_completions(request: ChatCompletionRequest):
             "model": request.model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
-        yield f"data: {final}\n\n"
+        yield f"data: {json.dumps(final)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

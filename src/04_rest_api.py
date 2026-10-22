@@ -100,9 +100,19 @@ model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     torch_dtype=torch.float16,
     device_map="auto",
 )
-processor = AutoProcessor.from_pretrained(MODEL)
+# Cap visual tokens per image (~512 tokens at 28x28 px/token). Without this
+# the client decides the token count and a multi-image request can demand
+# more vision-tower activation memory than the ~1 GiB left next to the fp16
+# weights on an 8 GiB GPU -> CUDA OOM. Smart-resize honors this cap.
+MAX_PIXELS = int(os.environ.get("EDUVLM_MAX_PIXELS", 512 * 28 * 28))
+processor = AutoProcessor.from_pretrained(MODEL, max_pixels=MAX_PIXELS)
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Model loaded. Device: {device}")
+print(f"Model loaded. Device: {device} (max_pixels={MAX_PIXELS})")
+
+# One generation at a time: the sync endpoint runs in FastAPI's threadpool,
+# so concurrent requests would otherwise run model.generate() in parallel
+# and multiply activation memory on an already memory-starved GPU.
+GENERATE_LOCK = threading.Lock()
 
 app = FastAPI(title="eduVLM", description="Qwen2.5-VL-3B OpenAI-compatible API")
 
@@ -161,7 +171,27 @@ def build_qwen_messages(messages) -> List[dict]:
     return qwen_messages
 
 def generate_answer(qwen_messages: List[dict], request: ChatCompletionRequest) -> str:
-    """Run the full VLM pipeline: template -> vision info -> tensors -> generate."""
+    """Run the full VLM pipeline: template -> vision info -> tensors -> generate.
+
+    Serialized by ``GENERATE_LOCK`` and OOM-resilient: a failed generation
+    frees the CUDA cache and surfaces as a retryable 503 instead of leaving
+    the server wedged.
+    """
+    try:
+        with GENERATE_LOCK:
+            return _generate_answer_locked(qwen_messages, request)
+    except HTTPException:
+        raise
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise HTTPException(
+            503,
+            "GPU out of memory serving this request; retry with fewer/smaller "
+            "images. The server remains available.",
+        )
+
+
+def _generate_answer_locked(qwen_messages: List[dict], request: ChatCompletionRequest) -> str:
     text = processor.apply_chat_template(
         qwen_messages,
         tokenize=False,
@@ -178,13 +208,16 @@ def generate_answer(qwen_messages: List[dict], request: ChatCompletionRequest) -
         return_tensors="pt",
     ).to(device)
 
+    sampling_kwargs = {}
+    if request.temperature and request.temperature > 0:
+        sampling_kwargs = {"temperature": request.temperature, "top_p": request.top_p}
+
     with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=request.max_tokens or 512,
-            do_sample=request.temperature > 0,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            do_sample=bool(sampling_kwargs),
+            **sampling_kwargs,
         )
 
     generated_ids = [
@@ -266,29 +299,39 @@ def chat_completions(request: ChatCompletionRequest):
 
     def run_generation():
         try:
-            text = processor.apply_chat_template(
-                qwen_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            image_inputs, video_inputs = process_vision_info(qwen_messages)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(device)
-            with torch.inference_mode():
-                model.generate(
-                    **inputs,
-                    max_new_tokens=request.max_tokens or 512,
-                    do_sample=request.temperature > 0,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    streamer=streamer,
+            with GENERATE_LOCK:
+                text = processor.apply_chat_template(
+                    qwen_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
+                image_inputs, video_inputs = process_vision_info(qwen_messages)
+                inputs = processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+                sampling_kwargs = {}
+                if request.temperature and request.temperature > 0:
+                    sampling_kwargs = {"temperature": request.temperature, "top_p": request.top_p}
+                with torch.inference_mode():
+                    model.generate(
+                        **inputs,
+                        max_new_tokens=request.max_tokens or 512,
+                        do_sample=bool(sampling_kwargs),
+                        streamer=streamer,
+                        **sampling_kwargs,
+                    )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            streamer.put(
+                "[error: GPU out of memory serving this request; "
+                "retry with fewer/smaller images]"
+            )
         finally:
+            streamer.end()
             cleanup_temp_files(qwen_messages)
 
     thread = threading.Thread(target=run_generation, daemon=True)
